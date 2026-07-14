@@ -1,16 +1,15 @@
-//! Full-screen alt-screen rendering + raw keyboard forwarding for the TUI.
+//! Full-screen alt-screen rendering + raw input forwarding for the TUI.
 //!
 //! When a PTY app switches to the alternate screen (vim, htop, less, …), the
 //! terminal model flips [`TerminalModel::is_alt_screen_active`] and populates a
 //! dedicated alt-screen grid. [`TuiTerminalSessionView`] then renders this
 //! element full-area instead of the block/transcript UI, and forwards
-//! keystrokes straight to the PTY as escape sequences — mirroring the GUI's
+//! input straight to the PTY as escape sequences — mirroring the GUI's
 //! `AltScreenElement` (`app/src/terminal/alt_screen/alt_screen_element.rs`).
 //!
-//! Covers rendering, the cursor, and keyboard forwarding. PTY sizing is
-//! handled by the session view's `TuiTerminalSizeElement` wrapper, which
-//! publishes this element's laid-out dimensions after every layout. Mouse
-//! forwarding is tracked as a follow-up.
+//! Covers rendering, the cursor, and keyboard and SGR mouse forwarding. PTY
+//! sizing is handled by the session view's `TuiTerminalSizeElement` wrapper,
+//! which publishes this element's laid-out dimensions after every layout.
 //!
 //! [`TuiTerminalSessionView`]: crate::terminal_session_view::TuiTerminalSessionView
 //! [`TerminalModel::is_alt_screen_active`]: warp::tui_export::TerminalModel
@@ -19,11 +18,13 @@ use std::ops::Deref as _;
 use std::sync::Arc;
 
 use parking_lot::FairMutex;
-use warp::tui_export::{KeystrokeWithDetails, TermMode, TerminalModel};
+use warp::tui_export::{KeystrokeWithDetails, TermMode, TerminalModel, ToEscapeSequence as _};
 use warp_terminal::model::grid::Dimensions as _;
+use warp_terminal::model::mouse::{MouseAction, MouseButton, MouseState};
+use warp_terminal::model::Point;
 use warpui_core::elements::tui::{
     TuiConstraint, TuiElement, TuiEvent, TuiEventContext, TuiLayoutContext, TuiPaintContext,
-    TuiPaintSurface, TuiScreenPoint, TuiScreenPosition, TuiSize,
+    TuiPaintSurface, TuiScreenPoint, TuiScreenPosition, TuiScreenRect, TuiSize,
 };
 use warpui_core::AppContext;
 
@@ -46,6 +47,65 @@ impl AltScreenElement {
             origin: None,
         }
     }
+}
+
+/// Converts a supported pointer event into the terminal's SGR mouse model.
+fn mouse_state_for_event(
+    event: &TuiEvent,
+    bounds: TuiScreenRect,
+    is_mode_set: impl Fn(TermMode) -> bool,
+) -> Option<MouseState> {
+    if !is_mode_set(TermMode::SGR_MOUSE) {
+        return None;
+    }
+
+    let reports_clicks = is_mode_set(TermMode::MOUSE_REPORT_CLICK)
+        || is_mode_set(TermMode::MOUSE_DRAG)
+        || is_mode_set(TermMode::MOUSE_MOTION);
+    let position = event.position()?;
+    if !bounds.contains(position) {
+        return None;
+    }
+    let point = Point::new(
+        usize::try_from(i32::from(position.y) - bounds.origin.y).ok()?,
+        usize::try_from(i32::from(position.x) - bounds.origin.x).ok()?,
+    );
+
+    let state = match event {
+        TuiEvent::LeftMouseDown { modifiers, .. } if reports_clicks && !modifiers.shift => {
+            MouseState::new(MouseButton::Left, MouseAction::Pressed, *modifiers)
+        }
+        TuiEvent::RightMouseDown { modifiers, .. } if reports_clicks && !modifiers.shift => {
+            MouseState::new(MouseButton::Right, MouseAction::Pressed, *modifiers)
+        }
+        TuiEvent::LeftMouseUp { modifiers, .. } if reports_clicks && !modifiers.shift => {
+            MouseState::new(MouseButton::Left, MouseAction::Released, *modifiers)
+        }
+        TuiEvent::LeftMouseDragged { modifiers, .. }
+            if (is_mode_set(TermMode::MOUSE_DRAG) || is_mode_set(TermMode::MOUSE_MOTION))
+                && !modifiers.shift =>
+        {
+            MouseState::new(MouseButton::LeftDrag, MouseAction::Pressed, *modifiers)
+        }
+        TuiEvent::MouseMoved {
+            modifiers,
+            is_synthetic: false,
+            ..
+        } if is_mode_set(TermMode::MOUSE_MOTION) => {
+            MouseState::new(MouseButton::Move, MouseAction::Pressed, *modifiers)
+        }
+        TuiEvent::ScrollWheel {
+            delta: (_, rows), ..
+        } if reports_clicks && *rows != 0 => MouseState::new(
+            MouseButton::Wheel,
+            MouseAction::Scrolled {
+                delta: i32::try_from(*rows).ok()?,
+            },
+            Default::default(),
+        ),
+        _ => return None,
+    };
+    Some(state.set_point(point))
 }
 
 impl TuiElement for AltScreenElement {
@@ -111,32 +171,37 @@ impl TuiElement for AltScreenElement {
         event_ctx: &mut TuiEventContext<'_>,
         _app: &AppContext,
     ) -> bool {
-        let TuiEvent::KeyDown {
-            keystroke,
-            chars,
-            details,
-            is_composing,
-        } = event
-        else {
-            // Mouse forwarding is a follow-up slice.
-            return false;
-        };
-        if *is_composing {
-            return false;
-        }
-        // Forward the key to the app. `to_pty_bytes` layers the fallbacks a
-        // single-`KeyDown` frontend needs — `Ctrl+<letter>` → C0, printable
-        // `chars`, and named control keys — on top of the shared
-        // `to_escape_sequence` encoder in `warp_terminal`. (ctrl-c never reaches
-        // here: the session view's interrupt handler forwards it to the app.)
+        // Forward the event to the app. Keys go through `to_pty_bytes`, which
+        // layers the fallbacks a single-`KeyDown` frontend needs —
+        // `Ctrl+<letter>` → C0, printable `chars`, and named control keys — on
+        // top of the shared `to_escape_sequence` encoder in `warp_terminal`.
+        // (ctrl-c never reaches here: the session view's interrupt handler
+        // forwards it to the app.) Pointer events are translated to SGR mouse
+        // reports when the app opted in.
         let bytes = {
             let model = self.model.lock();
-            KeystrokeWithDetails {
-                keystroke,
-                key_without_modifiers: details.key_without_modifiers.as_deref(),
-                chars: Some(chars.as_str()),
+            match event {
+                TuiEvent::KeyDown {
+                    keystroke,
+                    chars,
+                    details,
+                    is_composing: false,
+                } => KeystrokeWithDetails {
+                    keystroke,
+                    key_without_modifiers: details.key_without_modifiers.as_deref(),
+                    chars: Some(chars.as_str()),
+                }
+                .to_pty_bytes(model.deref()),
+                TuiEvent::KeyDown {
+                    is_composing: true, ..
+                } => None,
+                _ => self.origin.zip(self.size).and_then(|(origin, size)| {
+                    mouse_state_for_event(event, TuiScreenRect::new(origin, size), |mode| {
+                        model.is_term_mode_set(mode)
+                    })
+                    .and_then(|state| state.to_escape_sequence(model.deref()))
+                }),
             }
-            .to_pty_bytes(model.deref())
         };
         let Some(bytes) = bytes else {
             return false;

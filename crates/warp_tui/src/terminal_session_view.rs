@@ -194,8 +194,8 @@ pub(crate) enum TuiTerminalSessionAction {
     /// display-mode setting.
     ToggleUsageDisplay,
     /// Raw bytes to forward to the PTY, produced by the alt-screen element
-    /// while a full-screen app is active (keystrokes encoded to escape
-    /// sequences). Delivered to the manager as a [`PtyIntent::WriteAgentInput`].
+    /// while a full-screen app is active. Delivered to the manager as a
+    /// [`PtyIntent::WriteAgentInput`].
     ForwardToPty(Vec<u8>),
 }
 
