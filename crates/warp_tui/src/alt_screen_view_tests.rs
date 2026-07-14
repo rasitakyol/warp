@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use parking_lot::FairMutex;
-use warp::tui_export::{TermMode, TerminalModel, ToEscapeSequence as _};
+use warp::tui_export::{TermMode, TerminalModel};
+use warp_terminal::model::escape_sequences::ModeProvider;
 use warpui::EntityIdMap;
 use warpui_core::elements::tui::{
     TuiConstraint, TuiElement, TuiEvent, TuiLayoutContext, TuiPoint, TuiScreenPoint, TuiScreenRect,
@@ -10,7 +11,7 @@ use warpui_core::elements::tui::{
 use warpui_core::event::ModifiersState;
 use warpui_core::App;
 
-use super::{mouse_state_for_event, AltScreenElement};
+use super::{mouse_event_to_pty_bytes, AltScreenElement};
 
 const SGR_CLICK: TermMode = TermMode::SGR_MOUSE.union(TermMode::MOUSE_REPORT_CLICK);
 const SGR_DRAG: TermMode = TermMode::SGR_MOUSE.union(TermMode::MOUSE_DRAG);
@@ -24,10 +25,18 @@ fn bounds(x: i32, y: i32, width: u16, height: u16) -> TuiScreenRect {
     )
 }
 
+/// Supplies no terminal modes; mouse SGR encoding does not consult them.
+struct MouseModeProvider;
+
+impl ModeProvider for MouseModeProvider {
+    fn is_term_mode_set(&self, _mode: TermMode) -> bool {
+        false
+    }
+}
+
 /// Encodes `event` using the production TUI mouse-event adapter.
 fn mouse_bytes(event: &TuiEvent, area: TuiScreenRect, modes: TermMode) -> Option<Vec<u8>> {
-    let state = mouse_state_for_event(event, area, |mode| modes.contains(mode))?;
-    state.to_escape_sequence(&TerminalModel::mock(None, None))
+    mouse_event_to_pty_bytes(event, area, |mode| modes.contains(mode), &MouseModeProvider)
 }
 
 #[test]
@@ -108,7 +117,7 @@ fn sgr_mouse_events_use_area_relative_coordinates() {
                 precise: false,
                 modifiers,
             },
-            SGR_CLICK,
+            TermMode::SGR_MOUSE,
             b"\x1b[<64;3;2M".as_slice(),
         ),
         (
@@ -118,7 +127,7 @@ fn sgr_mouse_events_use_area_relative_coordinates() {
                 precise: false,
                 modifiers,
             },
-            SGR_CLICK,
+            TermMode::SGR_MOUSE,
             b"\x1b[<65;3;2M".as_slice(),
         ),
     ];
@@ -129,7 +138,7 @@ fn sgr_mouse_events_use_area_relative_coordinates() {
 }
 
 #[test]
-fn mouse_events_require_the_requested_reporting_mode() {
+fn click_and_motion_events_require_the_requested_reporting_mode() {
     let area = bounds(0, 0, 10, 10);
     let position = TuiPoint::new(2, 3);
     let modifiers = ModifiersState::default();
@@ -156,6 +165,26 @@ fn mouse_events_require_the_requested_reporting_mode() {
     assert!(mouse_bytes(&left_dragged, area, SGR_DRAG).is_some());
     assert!(mouse_bytes(&moved, area, SGR_DRAG).is_none());
     assert!(mouse_bytes(&moved, area, SGR_MOTION).is_some());
+}
+
+#[test]
+fn scroll_uses_sgr_when_available_and_arrows_otherwise() {
+    let scroll = TuiEvent::ScrollWheel {
+        position: TuiPoint::new(2, 3),
+        delta: (0, 1),
+        precise: false,
+        modifiers: ModifiersState::default(),
+    };
+    let area = bounds(0, 0, 10, 10);
+
+    assert_eq!(
+        mouse_bytes(&scroll, area, TermMode::NONE).as_deref(),
+        Some(b"\x1bOA".as_slice())
+    );
+    assert_eq!(
+        mouse_bytes(&scroll, area, TermMode::SGR_MOUSE).as_deref(),
+        Some(b"\x1b[<64;3;4M".as_slice())
+    );
 }
 
 #[test]
